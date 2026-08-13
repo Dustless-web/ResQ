@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">ResQ1</string>
+    <string name="accessibility_desc">Enables ResQ1 to detect emergency button gestures even when the screen is off.</string>
+</resources>
