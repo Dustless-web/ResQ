@@ -3,7 +3,10 @@ package com.example.resq1
 import android.app.Application
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.le.*
+
+import android.content.Context
 import android.content.Intent
+import android.net.wifi.p2p.WifiP2pManager
 import android.os.Bundle
 import android.os.ParcelUuid
 import android.speech.RecognitionListener
@@ -11,12 +14,15 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.util.Log
 import androidx.compose.runtime.*
+import androidx.compose.runtime.snapshots.SnapshotStateMap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.resq1.data.AppDatabase
 import com.example.resq1.data.Message
+import com.example.resq1.data.MediaType
 import com.example.resq1.network.LocationHelper
 import com.example.resq1.network.TriageAI
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import java.util.Random
@@ -37,13 +43,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // BLE Components
     private var advertiser: BluetoothLeAdvertiser? = null
     private var scanner: BluetoothLeScanner? = null
-    private var messageJob: kotlinx.coroutines.Job? = null
+    private var messageJob: Job? = null
     private val serviceUuid = ParcelUuid.fromString("00001234-0000-1000-8000-00805f9b34fb")
-    private val manufacturerId = 0xFFFF // Placeholder for ResQ Mesh
+    private val manufacturerId = 0x1234 
     private val receivedMessageHashes = mutableSetOf<String>()
     
     // Unified Identity
-    private val localMeshId: Int =  Random().nextInt()
+    private val localMeshId: Int = Random().nextInt()
 
     // UI State
     var messages by mutableStateOf<List<Message>>(emptyList())
@@ -57,13 +63,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var activeNodes = mutableStateMapOf<String, MeshNode>()
     var userName by mutableStateOf("RESCUER-" + String.format("%04d", Math.abs(localMeshId % 10000)))
 
+    // Wi-Fi Bridge State
+    private val wifiP2pManager: WifiP2pManager? by lazy { application.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager }
+    private var wifiChannel: WifiP2pManager.Channel? = null
+    var isTransferring by mutableStateOf(false)
+    var transferProgress by mutableStateOf("")
+
     private val speechRecognizer: SpeechRecognizer by lazy {
         SpeechRecognizer.createSpeechRecognizer(application)
     }
 
     val recentPeers = derivedStateOf {
         messages.asSequence()
-            .filter { it.sender != "Me" && it.lat != null && it.lon != null }
+            .filter { it.sender != userName && it.lat != null && it.lon != null }
             .groupBy { it.sender }
             .map { it.value.last() }
             .toList()
@@ -74,7 +86,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val record = result.scanRecord ?: return
             val data = record.getManufacturerSpecificData(manufacturerId) ?: return
             
-            // 1. Extract Mesh ID and Type
             if (data.size < 5) return
             val type = data[0].toInt()
             val meshId = ((data[1].toInt() and 0xFF) shl 24) or
@@ -82,10 +93,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                          ((data[3].toInt() and 0xFF) shl 8) or
                          (data[4].toInt() and 0xFF)
 
-            // 2. Filter Self
             if (meshId == localMeshId) return
 
-            // 3. Track active node by Mesh ID
             val node = MeshNode(
                 address = "NODE-${Integer.toHexString(meshId).uppercase()}",
                 lastSeen = System.currentTimeMillis(),
@@ -93,9 +102,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
             activeNodes[meshId.toString()] = node
 
-            // 4. Handle Data if it's a Chat/SOS packet (Length check to distinguish from heartbeat)
             if (data.size > 5 && (type == 0x01 || type == 0x02)) {
-                Log.d("ResQMesh", "Heard a Data Chirp from $meshId")
                 handleReceivedData(data, result.rssi)
             }
         }
@@ -108,21 +115,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         loadMessages()
-        // Pre-fill the hash bouncer with existing database messages to prevent duplicates on restart
+        wifiChannel = wifiP2pManager?.initialize(application, application.mainLooper, null)
+        
         viewModelScope.launch {
             messageDao.getAllHashes().collect { hashes ->
                 receivedMessageHashes.addAll(hashes)
             }
         }
         
-        // Listen for background panic triggers from Accessibility Service
         viewModelScope.launch {
             ResQAccessibilityService.panicTriggerFlow.collectLatest {
                 triggerPanicMode()
             }
         }
         
-        // Start background pruning of inactive nodes
         viewModelScope.launch {
             while (true) {
                 val now = System.currentTimeMillis()
@@ -142,8 +148,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun loadMessages() {
         messageJob?.cancel()
         messageJob = viewModelScope.launch {
-            messageDao.getMessagesByRoom(currentRoom).collect {
-                messages = it
+            messageDao.getMessagesByRoom(currentRoom).collect { list ->
+                messages = list
             }
         }
     }
@@ -165,32 +171,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         isScanning = true
         meshStatus = "Mesh Active"
         
-        // 1. Start Continuous Scanner
         val filter = ScanFilter.Builder().build()
         val scanSettings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
         
         try {
-            Log.d("ResQMesh", "Starting BLE Mesh Scanner...")
             scanner?.startScan(listOf(filter), scanSettings, scanCallback)
         } catch (e: SecurityException) {
             meshStatus = "Permission Error"
-            Log.e("ResQMesh", "SecurityException starting scan", e)
         }
 
-        // 2. Start Continuous Heartbeat
         startHeartbeat()
     }
 
     private fun startHeartbeat() {
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
             .setConnectable(false)
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
             .build()
         
-        // Heartbeat Payload: [Type(1b) | MeshID(4b)] = 5 bytes
         val payload = ByteArray(5)
         payload[0] = 0x00 
         payload[1] = (localMeshId shr 24).toByte()
@@ -200,7 +201,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         val data = AdvertiseData.Builder()
             .addManufacturerData(manufacturerId, payload)
-            .setIncludeTxPowerLevel(true)
+            .setIncludeTxPowerLevel(false)
             .build()
 
         try {
@@ -224,13 +225,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         meshStatus = "Paused"
     }
 
-    fun sendMessage(content: String, isSos: Boolean = false) {
+    fun sendMessage(content: String, isSos: Boolean = false, mediaType: MediaType = MediaType.TEXT, fileUri: String? = null) {
         val location = locationHelper.getLastKnownLocation()
         myLocation = location?.let { it.latitude to it.longitude }
         val timestamp = System.currentTimeMillis()
         val hash = generateHash(content, location?.latitude, location?.longitude)
         
-        // Save locally
         val localMsg = Message(
             sender = userName,
             content = content,
@@ -239,17 +239,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             lon = location?.longitude,
             roomName = currentRoom,
             messageHash = hash,
-            isSos = isSos
+            isSos = isSos,
+            mediaType = mediaType,
+            fileUri = fileUri
         )
         receivedMessageHashes.add(hash)
         viewModelScope.launch { messageDao.insert(localMsg) }
-
-        // Broadcast via BLE
         broadcastMessage(localMsg)
     }
 
     private fun generateHash(content: String, lat: Double?, lon: Double?): String {
-        // Round to 4 decimal places (~11m precision) to stabilize hash against GPS jitter
         val roundedLat = if (lat != null) (lat * 10000.0).roundToLong() / 10000.0 else 0.0
         val roundedLon = if (lon != null) (lon * 10000.0).roundToLong() / 10000.0 else 0.0
         return "$content|$roundedLat|$roundedLon"
@@ -303,20 +302,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val label = TriageAI.getSeverityLabel(severity)
         panicStatus = "SENT: $label"
         
-        // High priority broadcast
         val location = locationHelper.getLastKnownLocation()
         val timestamp = System.currentTimeMillis()
         val content = "[SOS] $text"
         val hash = generateHash(content, location?.latitude, location?.longitude)
 
         val sosMsg = Message(
-            sender = "SOS-ALERT",
+            sender = userName,
             content = content,
             timestamp = timestamp,
             lat = location?.latitude,
             lon = location?.longitude,
             roomName = "EMERGENCY",
-            messageHash = hash
+            messageHash = hash,
+            isSos = true
         )
         
         viewModelScope.launch { messageDao.insert(sosMsg) }
@@ -333,25 +332,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         
         val data = AdvertiseData.Builder()
             .addManufacturerData(manufacturerId, payload)
-            .setIncludeTxPowerLevel(true)
+            .setIncludeTxPowerLevel(false)
             .build()
 
         try {
-            Log.d("ResQMesh", "Starting BLE Broadcast (Size: ${payload.size})...")
             advertiser?.startAdvertising(settings, data, object : AdvertiseCallback() {
                 override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
                     Log.d("ResQMesh", "BLE Broadcast SUCCESS")
                 }
                 override fun onStartFailure(errorCode: Int) {
                     Log.e("ResQMesh", "BLE Broadcast FAILED: $errorCode")
-                    if (errorCode == AdvertiseCallback.ADVERTISE_FAILED_DATA_TOO_LARGE) {
-                        Log.e("ResQMesh", "Packet data exceeds BLE limits!")
-                    }
                 }
             })
-        } catch (e: SecurityException) {
-            Log.e("ResQMesh", "SecurityException starting advertising", e)
-        }
+        } catch (e: SecurityException) { }
     }
 
     private fun handleReceivedData(data: ByteArray, rssi: Int) {
@@ -368,28 +361,51 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // --- Optimized Binary Encoding (Fits 31-byte limit) ---
-    // Structure: [Type(1b) | MeshID(4b) | RoomID(1b) | Lat(4b) | Lon(4b) | Content(7b)] = 21 bytes
+    fun requestHighSpeedLink(messageId: Int) {
+        isTransferring = true
+        transferProgress = "Searching for peer..."
+        
+        try {
+            wifiP2pManager?.discoverPeers(wifiChannel, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    transferProgress = "Bridge Ready. Tap 'Accept' on both phones."
+                }
+                override fun onFailure(reason: Int) {
+                    isTransferring = false
+                    panicStatus = "Bridge Failed: $reason"
+                }
+            })
+        } catch (e: SecurityException) {
+            isTransferring = false
+            panicStatus = "Permission Denied"
+        }
+    }
+
+    // --- Optimized Binary Encoding ---
+    // Structure: [Type(1b) | MeshID(4b) | RoomID+Media(1b) | Lat(4b) | Lon(4b) | Content(6b)] = 20 bytes
     
     private fun encodeMessage(msg: Message): ByteArray {
-        val contentBytes = msg.content.take(7).toByteArray()
+        val contentBytes = msg.content.take(6).toByteArray()
         val data = ByteArray(14 + contentBytes.size)
         data[0] = if (msg.isSos) 0x02.toByte() else 0x01.toByte()
         
-        // Mesh ID
         data[1] = (localMeshId shr 24).toByte()
         data[2] = (localMeshId shr 16).toByte()
         data[3] = (localMeshId shr 8).toByte()
         data[4] = localMeshId.toByte()
 
-        // Room ID
-        data[5] = when(msg.roomName) {
+        val roomId = when(msg.roomName) {
             "MEDICAL" -> 1
             "SUPPLY" -> 2
             else -> 0
-        }.toByte()
+        }
+        val mediaFlag = when(msg.mediaType) {
+            MediaType.IMAGE -> 1
+            MediaType.VIDEO -> 2
+            else -> 0
+        }
+        data[5] = ((roomId shl 4) or mediaFlag).toByte()
 
-        // Lat/Lon
         val latBits = java.lang.Float.floatToIntBits(msg.lat?.toFloat() ?: 0f)
         val lonBits = java.lang.Float.floatToIntBits(msg.lon?.toFloat() ?: 0f)
         
@@ -409,11 +425,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                      ((data[3].toInt() and 0xFF) shl 8) or
                      (data[4].toInt() and 0xFF)
         
-        val roomId = data[5].toInt()
+        val combinedByte = data[5].toInt()
+        val roomId = (combinedByte shr 4) and 0x0F
+        val mediaFlag = combinedByte and 0x0F
+        
         val roomName = when(roomId) {
             1 -> "MEDICAL"
             2 -> "SUPPLY"
             else -> "GENERAL"
+        }
+        
+        val mediaType = when(mediaFlag) {
+            1 -> MediaType.IMAGE
+            2 -> MediaType.VIDEO
+            else -> MediaType.TEXT
         }
 
         var latBits = 0
@@ -438,7 +463,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             roomName = roomName,
             messageHash = hash,
             rssi = rssi,
-            isSos = (type == 0x02)
+            isSos = (type == 0x02),
+            mediaType = mediaType
         )
     }
 }

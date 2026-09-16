@@ -4,6 +4,10 @@ import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
 
+enum class MediaType {
+    TEXT, IMAGE, VIDEO
+}
+
 @Entity(
     tableName = "messages",
     indices = [Index(value = ["messageHash"], unique = true)]
@@ -18,5 +22,7 @@ data class Message(
     val roomName: String = "GENERAL",
     val messageHash: String,
     val rssi: Int = 0,
-    val isSos: Boolean = false
+    val isSos: Boolean = false,
+    val mediaType: MediaType = MediaType.TEXT,
+    val fileUri: String? = null
 )

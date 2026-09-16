@@ -1,5 +1,7 @@
 package com.example.resq1
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.BorderStroke
@@ -29,6 +31,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -36,7 +39,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import coil.compose.AsyncImage
 import com.example.resq1.data.Message
+import com.example.resq1.data.MediaType
 import com.example.resq1.ui.theme.*
 import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.camera.CameraUpdateFactory
@@ -266,8 +271,8 @@ fun ChatTab(viewModel: MainViewModel) {
     var text by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     
-    LaunchedEffect(viewModel.messages.size) {
-        if (viewModel.messages.isNotEmpty()) listState.animateScrollToItem(viewModel.messages.size - 1)
+    val photoLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        uri?.let { viewModel.sendMessage("[IMAGE]", mediaType = MediaType.IMAGE, fileUri = it.toString()) }
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
@@ -321,6 +326,10 @@ fun ChatTab(viewModel: MainViewModel) {
                 modifier = Modifier.fillMaxSize().padding(horizontal = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                IconButton(onClick = { photoLauncher.launch("image/*") }) {
+                    Icon(Icons.Default.Add, contentDescription = "Add Media", tint = ElectricCyan)
+                }
+
                 TextField(
                     value = text,
                     onValueChange = { text = it },
@@ -379,6 +388,20 @@ fun GlassMessageItem(message: Message) {
                     }
                 }
                 Spacer(modifier = Modifier.height(4.dp))
+                
+                if (message.mediaType == MediaType.IMAGE && message.fileUri != null) {
+                    AsyncImage(
+                        model = message.fileUri,
+                        contentDescription = null,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(180.dp)
+                            .clip(RoundedCornerShape(12.dp)),
+                        contentScale = ContentScale.Crop
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+                
                 Text(text = message.content, color = TextHigh, fontSize = 15.sp)
                 
                 if (message.lat != null) {
@@ -387,6 +410,16 @@ fun GlassMessageItem(message: Message) {
                         text = "${String.format(Locale.US, "%.4f", message.lat)}, ${String.format(Locale.US, "%.4f", message.lon)}",
                         fontSize = 8.sp, color = TextLow, fontFamily = FontFamily.Monospace
                     )
+                }
+                
+                if (!isMe && message.mediaType != MediaType.TEXT) {
+                    Button(
+                        onClick = { /* Will trigger Wi-Fi Direct Bridge in Step 2 */ },
+                        modifier = Modifier.padding(top = 8.dp).fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan.copy(alpha = 0.2f))
+                    ) {
+                        Text("REQUEST HIGH-SPEED LINK", color = ElectricCyan, fontSize = 10.sp)
+                    }
                 }
             }
         }
